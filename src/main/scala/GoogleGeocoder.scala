@@ -1,5 +1,6 @@
 import DB.SaveGoogleResponse
 import Utils.textSample
+import BatchParserCmd.AvailableQuota
 import akka.actor.{Actor, ActorLogging, ActorRef, Props, Status}
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model._
@@ -7,13 +8,13 @@ import akka.stream.{ActorMaterializer, ActorMaterializerSettings}
 import akka.util.ByteString
 
 object GoogleGeocoder {
-  def props(googleApiKey: String, maxOpenRequests: Int, maxFatalErrors: Int, db: ActorRef, addressParser: ActorRef, parseAddress: Boolean): Props =
-    Props(new GoogleGeocoder(googleApiKey, maxOpenRequests, maxFatalErrors, db, addressParser, parseAddress))
+  def props(googleApiKey: String, maxOpenRequests: Int, maxFatalErrors: Int, db: ActorRef, addressParser: ActorRef, parseAddress: Boolean, batchParserCmd: ActorRef): Props =
+    Props(new GoogleGeocoder(googleApiKey, maxOpenRequests, maxFatalErrors, db, addressParser, parseAddress, batchParserCmd))
 
   final case class GeoCode(id: Int, unformattedAddress: String)
 }
 
-class GoogleGeocoder(googleApiKey: String, maxOpenRequests: Int, maxFatalErrors: Int, db: ActorRef, addressParser: ActorRef, parseAddress: Boolean) extends Actor with ActorLogging {
+class GoogleGeocoder(googleApiKey: String, maxOpenRequests: Int, maxFatalErrors: Int, db: ActorRef, addressParser: ActorRef, parseAddress: Boolean, batchParserCmd: ActorRef) extends Actor with ActorLogging {
   import GoogleGeocoder._
   import AddressParserActor._
   import akka.pattern.pipe
@@ -24,6 +25,8 @@ class GoogleGeocoder(googleApiKey: String, maxOpenRequests: Int, maxFatalErrors:
   val http = Http(context.system)
 
   var numFatalErrors = 0
+  var numTotalRequests = 0
+  val controlFactor = 10
 
   val queue = new scala.collection.mutable.Queue[(Int, String)]
   var numOpenRequests = 0
@@ -32,6 +35,7 @@ class GoogleGeocoder(googleApiKey: String, maxOpenRequests: Int, maxFatalErrors:
 
   def receive = {
     case GeoCode(id, unformattedAddress) =>
+      numTotalRequests += 1
       if (numFatalErrors < maxFatalErrors) {
         log.info(s"GeoCode #$id: $unformattedAddress")
         if (numOpenRequests < maxOpenRequests)
@@ -41,6 +45,8 @@ class GoogleGeocoder(googleApiKey: String, maxOpenRequests: Int, maxFatalErrors:
       } else {
         log.info(s"GeoCode. ignored because of MaxFatalErrors")
       }
+      sender ! AvailableQuota((maxOpenRequests - controlFactor * maxOpenRequests * (numFatalErrors / (numTotalRequests * 1.0)) - numOpenRequests).toInt)
+
 
     case (id: Int, resp @ HttpResponse(StatusCodes.OK, headers, entity, _)) =>
       log.info(s"Success response coming for #$id")
@@ -94,6 +100,7 @@ class GoogleGeocoder(googleApiKey: String, maxOpenRequests: Int, maxFatalErrors:
       val (id: Int, unformattedAddress: String) = queue.dequeue
       query(id, unformattedAddress)
     }
+    batchParserCmd ! AvailableQuota((maxOpenRequests - controlFactor * maxOpenRequests * (numFatalErrors / (numTotalRequests * 1.0)) - numOpenRequests).toInt)
   }
 
   def fatalError() {  // TODO: I get several fatalError #0. not thead-safe?!
