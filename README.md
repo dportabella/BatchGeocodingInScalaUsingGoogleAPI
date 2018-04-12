@@ -1,14 +1,14 @@
 # BatchGeocodingInScalaUsingGoogleAPI
 
-This is a simple Scala program for parsing a list of addresses using google maps api.
+This is a simple program for parsing a list of addresses using google maps api.
 
 The main function for parsing a single address is implemented on `src/main/scala/AddressParser.scala`:
 - It builds the proper URL google maps query with the requested address
 - It uses Play Json to parse the json response
 - It extracts the data we need and it builds an Address case class
 
-`BatchParsderCmd` uses akka in order to query and parse a list of addresses asynchronously.
-It queries the addresses from a database, and it uses three actors: GoogleGeocoder, AddressParserActor, and DB to save the results.
+`BatchParsderCmd` queries the addresses from a database, queries each address using google maps api, parses it and saves the result to the DB.
+It is implemented in Scala with akka streams and slick for optimal performance.
 
 
 # Requirements
@@ -215,26 +215,22 @@ Usage: BatchParserCmd [options]
 
   --op <value>    where value = googleQueryAndParse, googleQueryOnly or parseOnly
   --maxEntries <value>
-  --maxGoogleAPIOpenRequests <value>
+  --maxGoogleAPIRequestsPerSecond <value>
   --maxGoogleAPIFatalErrors <value>
   --googleApiKey <value>
   --dbUrl <value>
   --tableName <value>
   --version                
 
-$ sbt "runMain BatchParserCmd --op=googleQueryAndParse --maxEntries=20 --maxGoogleAPIOpenRequests=10 --maxGoogleAPIFatalErrors=5 --googleApiKey="$googleApiKey" --dbUrl="$dbUrl" --tableName=addresses"
+$ sbt "runMain BatchParserCmd --op=googleQueryAndParse --maxEntries=20 --maxGoogleAPIRequestsPerSecond=10 --maxGoogleAPIFatalErrors=5 --googleApiKey="$googleApiKey" --dbUrl="$dbUrl" --tableName=addresses"
 ```
-`maxGoogleQueries` is the max number of google queries to do. It's best to try with a small number first.
+`maxEntries` is the max number of google queries to do. It's best to try with a small number first.
 The program will also stop if the max number of queries to the google api is exceeded (2500 request per day for the free account).
 You can then execute this same command the following day, and it will resume the process (it will not re-download what it has queried already). 
 
-This version of the program fails with akka showing "dead letters" if there are too many addresses.
-A workaround is to call this command before running sbt: `export SBT_OPTS="-Xmx2G -XX:+UseConcMarkSweepGC -XX:+CMSClassUnloadingEnabled -XX:MaxPermSize=2G -Xss2M  -Duser.timezone=GMT"`.
-The better option is to use the akka stream version of this program, which uses back-pressure. See the git branch of this project.
+The program queries google in parallel. The bigger `maxGoogleAPIRequestsPerSecond`, the faster to query all addresses. Google has a rate limit and a daily limit, so try before with smalls numbers.
 
-The program queries google in parallel. The bigger `maxOpenRequests`, the faster to query all addresses. Google has a rate limit, so try before with smalls numbers. Not more than 32.
-
-The program will stop after `maxFatalErrors`. Set a small number.
+The program will stop after `maxGoogleAPIFatalErrors`. Set a small number.
 
 
 ### Query the results

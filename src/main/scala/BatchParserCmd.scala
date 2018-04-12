@@ -1,13 +1,22 @@
+import Model._
 import akka.actor.ActorSystem
+import akka.http.scaladsl.Http
+import akka.stream.scaladsl.Source
+import akka.stream.{ActorMaterializer, Materializer}
+import akka.{Done, NotUsed}
+import com.typesafe.scalalogging.Logger
 
-import scala.io.StdIn
+import scala.concurrent.{ExecutionContext, ExecutionContextExecutor}
+import scala.util.Try
 
 object BatchParserCmd {
+  private val log = Logger("BatchParserCmd")
+
   case class Config(
-                   op: String = "",
-                   maxEntries: Int = 100,
-                   maxGoogleAPIOpenRequests: Int = 10,
-                   maxGoogleAPIFatalErrors: Int = 5,
+                     op: String = "",
+                     maxEntries: Int = 100,
+                     maxGoogleAPIRequestsPerSecond: Int = 10,
+                     maxGoogleAPIFatalErrors: Int = 5,
                      googleApiKey: String = "",
                      dbUrl: String = "",
                      tableName: String = ""
@@ -22,8 +31,8 @@ object BatchParserCmd {
     opt[Int]("maxEntries").required.action((x, c) =>
       c.copy(maxEntries = x)).text("maxEntries")
 
-    opt[Int]("maxGoogleAPIOpenRequests").optional.action((x, c) =>
-      c.copy(maxGoogleAPIOpenRequests = x)).text("maxGoogleAPIOpenRequests")
+    opt[Int]("maxGoogleAPIRequestsPerSecond").optional.action((x, c) =>
+      c.copy(maxGoogleAPIRequestsPerSecond = x)).text("maxGoogleAPIRequestsPerSecond")
 
     opt[Int]("maxGoogleAPIFatalErrors").optional.action((x, c) =>
       c.copy(maxGoogleAPIFatalErrors = x)).text("maxGoogleAPIFatalErrors")
@@ -43,53 +52,75 @@ object BatchParserCmd {
   def main(args: Array[String]) {
     parser.parse(args, Config()) match {
       case Some(config) =>
-        println("+++ config: " + config)
+        log.info("+++ config: " + config)
 
         require(config.op == "googleQueryAndParse" || config.op == "googleQueryOnly" || config.op == "parseOnly")
 
-        val system: ActorSystem = ActorSystem("System")
-        try {
-          if (config.op == "googleQueryAndParse" || config.op == "googleQueryOnly") {
-            val parseAddress = config.op == "googleQueryAndParse"
-            googleQueryAndParse(system, config.maxEntries, config.googleApiKey, config.maxGoogleAPIOpenRequests, config.maxGoogleAPIFatalErrors, parseAddress, config.dbUrl, config.tableName)
-          } else {
-            parseOnly(system, config.maxEntries, config.dbUrl, config.tableName)
-          }
-          println(">>> Press ENTER to exit <<<")
-          StdIn.readLine()
-        } finally {
+        implicit val system: ActorSystem = ActorSystem()
+        implicit val materializer: Materializer = ActorMaterializer()
+        implicit val executionContext: ExecutionContextExecutor = system.dispatcher
+
+        val db = new DB(config.dbUrl, config.tableName)
+
+        def terminateSystem() = {
+          log.info("terminating actor system")
+          Http().shutdownAllConnectionPools()
           system.terminate()
+        }
+
+        if (config.op == "googleQueryAndParse" || config.op == "googleQueryOnly") {
+          val parseAddress = config.op == "googleQueryAndParse"
+          googleQueryAndParse(parseAddress, config.maxEntries, config.googleApiKey, config.maxGoogleAPIRequestsPerSecond, config.maxGoogleAPIFatalErrors, db, terminateSystem)
+        } else {
+          parseOnly(system, config.maxEntries, db, terminateSystem)
         }
       case None => sys.exit(1)
     }
   }
 
-  def googleQueryAndParse(system: ActorSystem, maxEntries: Int, googleApiKey: String, maxOpenRequests: Int, maxFatalErrors: Int, parseAddress: Boolean, dbUrl: String, tableName: String) {
-    val conn = Utils.getDbConnection(dbUrl)
-    val unformattedAddresses: List[(Int, String)] = try {
-      DB.getAddressesWithEmptyGoogleResponseFromDatabase(tableName, maxEntries)(conn)
-    } finally { conn.close() }
+  def googleQueryAndParse(
+                           parseAddress: Boolean,
+                           maxEntries: Int,
+                           googleApiKey: String,
+                           maxGoogleAPIRequestsPerSecond: Int,
+                           maxGoogleAPIFatalErrors: Int,
+                           db: DB,
+                           finishedFn: () => Unit
+                         )
+                         (implicit actorSystem: ActorSystem, materialize: Materializer, executionContent: ExecutionContext) {
 
-    println(s"num unformattedAddresses to query: ${unformattedAddresses.length}")
+    val googleApiResponse: Source[GoogleResponse, NotUsed] =
+      GoogleGeocoder.flow(db, googleApiKey, maxGoogleAPIRequestsPerSecond, maxGoogleAPIFatalErrors, maxEntries)
 
-    val db = system.actorOf(DB.props(dbUrl, tableName), "DB")
-    val addressParser = system.actorOf(AddressParserActor.props(db), "AddressParser")
-    val googleGeocoder = system.actorOf(GoogleGeocoder.props(googleApiKey, maxOpenRequests: Int, maxFatalErrors: Int, db, addressParser, parseAddress), "GoogleAPI")
-
-    unformattedAddresses.foreach { case (id, unformattedAddress) => googleGeocoder ! GoogleGeocoder.GeoCode(id, unformattedAddress) }
+    if(!parseAddress){
+      googleApiResponse
+        .runWith(db.saveGoogleResponse())
+        .foreach(_ => finishedFn())
+    } else {
+      googleApiResponse
+        .map(parse)
+        .runWith(db.saveAddressParsingResultSink())
+        .recover { case t: Throwable => log.error("googleQueryAndParse error", t); Done }
+        .foreach(_ => finishedFn())
+    }
   }
 
-  def parseOnly(system: ActorSystem, maxEntries: Int, dbUrl: String, tableName: String) {
-    val conn = Utils.getDbConnection(dbUrl)
-    val googleResponses: List[(Int, String)] = try {
-      DB.getUnparsedGoogleResponsesFromDatabase(tableName, maxEntries)(conn)
-    } finally { conn.close() }
+  def parseOnly(
+                 system: ActorSystem,
+                 maxEntries: Int,
+                 db: DB,
+                 finishedFn: () => Unit
+               )
+               (implicit actorSystem: ActorSystem, materialize: Materializer, executionContent: ExecutionContext) {
+    db.getUnparsedGoogleResponsesFromDatabase(maxEntries)
+      .map(parse)
+      .runWith(db.saveAddressParsingResultSink())
+      .recover { case t: Throwable => log.error("parseOnly error", t); Done }
+      .foreach(_ => finishedFn())
+  }
 
-    println(s"num googleResponses: ${googleResponses.length}")
-
-    val db = system.actorOf(DB.props(dbUrl, tableName), "DB")
-    val addressParser = system.actorOf(AddressParserActor.props(db), "AddressParser")
-
-    googleResponses.foreach { case (id, googleResponse) => addressParser ! AddressParserActor.ParseAddress(id, googleResponse) }
+  def parse(googleResponse: GoogleResponse): AddressParsingResult = {
+    val result = Try(AddressParser.parseAddressFromJsonResponse(googleResponse.googleResponse))
+    AddressParsingResult(googleResponse, result)
   }
 }

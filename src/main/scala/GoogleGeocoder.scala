@@ -1,107 +1,75 @@
-import DB.SaveGoogleResponse
-import Utils.textSample
-import akka.actor.{Actor, ActorLogging, ActorRef, Props, Status}
+import java.util.concurrent.TimeoutException
+
+import Model._
+import akka.NotUsed
+import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
-import akka.http.scaladsl.model._
-import akka.stream.{ActorMaterializer, ActorMaterializerSettings}
+import akka.http.scaladsl.model.{HttpRequest, HttpResponse, StatusCodes}
+import akka.stream._
+import akka.stream.scaladsl.{Flow, Source}
 import akka.util.ByteString
+import com.typesafe.scalalogging.Logger
+
+import scala.concurrent.duration._
+import scala.concurrent.{ExecutionContext, Future}
 
 object GoogleGeocoder {
-  def props(googleApiKey: String, maxOpenRequests: Int, maxFatalErrors: Int, db: ActorRef, addressParser: ActorRef, parseAddress: Boolean): Props =
-    Props(new GoogleGeocoder(googleApiKey, maxOpenRequests, maxFatalErrors, db, addressParser, parseAddress))
+  private val log = Logger("GoogleGeocoder")
 
-  final case class GeoCode(id: Int, unformattedAddress: String)
-}
+  def flow(db: DB,
+           googleApiKey: String,
+           maxRequestsPerSecond: Int,
+           maxFatalErrors: Int,
+           maxEntries: Int)
+          (implicit
+                actorSystem: ActorSystem,
+                materialize: Materializer,
+                executionContent: ExecutionContext): Source[GoogleResponse, NotUsed] = {
 
-class GoogleGeocoder(googleApiKey: String, maxOpenRequests: Int, maxFatalErrors: Int, db: ActorRef, addressParser: ActorRef, parseAddress: Boolean) extends Actor with ActorLogging {
-  import GoogleGeocoder._
-  import AddressParserActor._
-  import akka.pattern.pipe
-  import context.dispatcher
+    val http = Http(actorSystem)
 
-  final implicit val materializer: ActorMaterializer = ActorMaterializer(ActorMaterializerSettings(context.system))
+    val queryGoogleApiFlow: Flow[UnformattedAddress, Either[String, GoogleResponse], _] = Flow[UnformattedAddress].mapAsync(maxRequestsPerSecond) { geoCode: UnformattedAddress =>
+      val uri = AddressParser.url(googleApiKey, geoCode.unformattedAddress)
 
-  val http = Http(context.system)
-
-  var numFatalErrors = 0
-
-  val queue = new scala.collection.mutable.Queue[(Int, String)]
-  var numOpenRequests = 0
-
-  var numRequests = 0
-
-  def receive = {
-    case GeoCode(id, unformattedAddress) =>
-      if (numFatalErrors < maxFatalErrors) {
-        log.info(s"GeoCode #$id: $unformattedAddress")
-        if (numOpenRequests < maxOpenRequests)
-          query(id, unformattedAddress)
-        else
-          queue += ((id, unformattedAddress))
-      } else {
-        log.info(s"GeoCode. ignored because of MaxFatalErrors")
+      http.singleRequest(request = HttpRequest(uri = uri)).flatMap {
+        case resp @ HttpResponse(StatusCodes.OK, headers, entity, protocol) =>
+          entity.dataBytes.runFold(ByteString(""))(_ ++ _)
+            .map(_.utf8String)
+            .map(r => validGoogleResponse(geoCode.id, r))
+        case resp @ HttpResponse(code, headers, entity, protocol) =>
+          resp.discardEntityBytes()
+          val msg = s"Request failed for #${geoCode.id}, response code: $code"
+          log.error(msg)
+          Future.successful(Left(msg))
+      }.recover {
+        case error: akka.stream.StreamTcpException =>
+          val msg = s"Request failed for #${geoCode.id}: ${error.getMessage}"
+          log.error(msg)
+          throw new TimeoutException(msg)
+        case error =>
+          val msg = s"Request failed for #${geoCode.id}: ${error.getMessage}"
+          log.error(msg)
+          Left(msg)
       }
-
-    case (id: Int, resp @ HttpResponse(StatusCodes.OK, headers, entity, _)) =>
-      log.info(s"Success response coming for #$id")
-      entity.dataBytes.runFold(ByteString(""))(_ ++ _).map((id, _)).pipeTo(self)
-
-    case (id: Int, body: ByteString) =>
-      val googleResponse = body.utf8String
-      numOpenRequests = numOpenRequests - 1
-      queryNext()
-      log.info(s"Success response for #$id: ${textSample(googleResponse)}")
-
-      AddressParser.findGoogleGeocoderFatalErrorFromJsonResponse(googleResponse) match {
-        case Some(googleGeocoderFatalError) => log.info(s"#$id: " + googleGeocoderFatalError.toString); fatalError()
-        case None =>
-          db ! SaveGoogleResponse(id, googleResponse)
-          if (parseAddress)
-            addressParser ! ParseAddress(id, googleResponse)
-      }
-
-    case (id: Int, resp @ HttpResponse(code, _, _, _)) =>
-      log.info(s"Request failed for #$id, response code: $code")
-      resp.discardEntityBytes()
-      numOpenRequests = numOpenRequests - 1
-      queryNext()
-      fatalError()
-
-    case f: Status.Failure =>
-      log.info("failure" + textSample(f))
-
-    case m =>
-      log.info("unexpected message: " + textSample(m))
-  }
-
-  def query(id: Int, unformattedAddress: String) {
-    if (numFatalErrors < maxFatalErrors) {
-      numOpenRequests = numOpenRequests + 1
-      numRequests = numRequests + 1
-      log.info(s"query num $numRequests: #$id, $unformattedAddress")
-      val url = AddressParser.url(googleApiKey, unformattedAddress)
-      http
-        .singleRequest(HttpRequest(uri = url))
-        .map(r => (id, r))
-        .pipeTo(self)
-    } else {
-      log.info(s"query. ignored because of MaxFatalErrors")
     }
+
+    val googleApiResponse: Source[Either[String, GoogleResponse], NotUsed] =
+      db.getAddressesWithEmptyGoogleResponseFromDatabase(maxEntries)
+        .throttle(maxRequestsPerSecond, 1.second, 0, ThrottleMode.Shaping)
+        .via(queryGoogleApiFlow)
+        .mapMaterializedValue(_ => NotUsed)
+
+    val (killSwitch, countAndFilterFatalErrors) = Utils.retryFlow[GoogleResponse](maxFatalErrors, log)
+
+    googleApiResponse
+      .recoverWithRetries(-1, { case _ => googleApiResponse })
+      .via(killSwitch.flow)
+      .via(countAndFilterFatalErrors)
   }
 
-  def queryNext() {
-    if (queue.nonEmpty) {
-      val (id: Int, unformattedAddress: String) = queue.dequeue
-      query(id, unformattedAddress)
+  def validGoogleResponse(geocodeId: Int, googleResponse: String): Either[String, GoogleResponse] =
+    AddressParser.findGoogleGeocoderFatalErrorFromJsonResponse(googleResponse) match {
+      case Some(error) => Left(error.getMessage)
+      case None => Right(GoogleResponse(geocodeId, googleResponse))
     }
-  }
-
-  def fatalError() {  // TODO: I get several fatalError #0. not thead-safe?!
-    log.info(s"fatalError #$numFatalErrors on ${self.path.name}")
-    numFatalErrors = numFatalErrors + 1
-    if (numFatalErrors > maxFatalErrors) {
-      log.info(s"MaxFatalErrors reached. stopping ${self.path.name}")
-      context.stop(self)
-    }
-  }
 }
